@@ -29,11 +29,11 @@
     <script>
         const EXTENDED_FRAME_START_FLAG = 0xf0;
         const STANDARD_FRAME_START_FLAG = 0xf1;
-        const START_FRAME_FLAG = 0xf2;
+        const STOP_FRAME_FLAG = 0xf2;
         const BYTE_STUFFING_FLAG = 0xf3;
 
         const commands = {
-            CSAFE_GETSTATUS: [0x80, []],
+            CSAFE_GETSTATUS_CMD: [0x80, []],
             CSAFE_RESET_CMD: [0x81, []],
             CSAFE_GOIDLE_CMD: [0x82, []],
             CSAFE_GOHAVEID_CMD: [0x83, []],
@@ -147,6 +147,10 @@
         const deviceStatus = $i("deviceStatus");
         let device;
 
+        if (navigator.usb === undefined) {
+            alert("WebUSB is not supported in this browser, please use the latest version of any Chromium-based browser (Chrome, Edge, Brave, etc.)");
+        }
+
         async function connect() {
             deviceStatus.innerText = "Waiting for selection...";
 
@@ -164,11 +168,248 @@
             console.log(device.manufacturerName);
         }
 
-        async function write(args) {
-            for (let i = 0; i < args.size; i++) {
-                let arg = args[i];
+        function popAt(arr, index) {
+            const i = Math.floor(index);
+            if (i < 0 || i >= arr.length) return undefined;
 
+            const removed = arr[i];
+            for (let j = i; j < arr.length - 1; j++) {
+                arr[j] = arr[j + 1];
             }
+
+            arr.length = arr.length - 1;
+            return removed;
+        }
+
+        function checkMessage(message) {
+            let i = 0;
+            let checksum = 0;
+
+            while (i < message.length) {
+                if (message[i] === BYTE_STUFFING_FLAG) {
+                    let stuffValue = popAt(message, i + 1);
+                    message[i] = 0xf0 | stuffValue;
+                }
+
+                checksum = checksum ^ message[i];
+                i++;
+            }
+
+            if (checksum !== 0) {
+                console.warn(`Checksum error: ${checksum}`);
+                return [];
+            }
+
+            delete message[message.length - 1];
+            return message;
+        }
+
+        function write(args) {
+            let message = [];
+            let i = 0;
+            let wrapper = 0;
+            let wrapped = [];
+            let maxResponse = 3;
+
+            while (i < args.length) {
+                let arg = args[i];
+                let cmdProp = commands[arg];
+                let command = [];
+
+                if (cmdProp[1].length !== 0) {
+                    cmdProp[1].forEach(varBytes => {
+                        i++;
+                        let intValue = args[i];
+                        let value = intToBytes(varBytes, intValue);
+                        command.push(value);
+                    })
+
+                    let cmdBytes = command.length
+                    command.unshift(cmdBytes);
+                }
+
+                command.unshift(cmdProp[0]);
+
+                if (cmdProp.length > 0 && (cmdProp.length < 3 || cmdProp[2] !== wrapper)) {
+                    wrapped.unshift(wrapped.length);
+                    wrapped.unshift(wrapper);
+                    message.push(wrapped);
+                    wrapped = [];
+                    wrapper = 0;
+                }
+
+                if (cmdProp.length === 3) {
+                    if (wrapper === cmdProp[2]) {
+                        wrapped.push(command);
+                    } else {
+                        wrapped = command;
+                        wrapper = cmdProp[2];
+                        maxResponse += 2;
+                    }
+
+                    command = [];
+                }
+
+                let cmdId = cmdProp[0] | (wrapper << 8);
+                maxResponse += Math.abs(responses[cmdId][1].reduce((a, b) => a + b, 0));
+                message.push(command);
+                i++;
+            }
+
+            if (wrapped.length > 0) {
+                wrapped.unshift(wrapped.length);
+                wrapped.unshift(wrapper);
+                message.push(wrapped);
+            }
+
+            let checksum = 0;
+            let j = 0;
+
+            while (j < message.length) {
+                checksum = checksum ^ message[j]
+
+                if (0xf0 <= message[j] <= 0xf3) {
+                    message.splice(j, 0, BYTE_STUFFING_FLAG);
+                    j++;
+                    message[j] = message[j] & 0x3;
+                }
+
+                j++;
+            }
+
+            message.push(checksum);
+            message.unshift(STANDARD_FRAME_START_FLAG);
+            message.append(STOP_FRAME_FLAG);
+
+            if (message.length > 96) {
+                console.warn(`Message is too long: ${message.length} > 96 bytes`);
+            }
+
+            let maxMessage = Math.max(message.length + 1, maxResponse);
+
+            if (maxMessage > 21) {
+                message.unshift(0x01);
+                for (let n = 0; n < 21 - message.length; n++) {
+                    message.push(0);
+                }
+            } else if (maxMessage <= 63) {
+                message.unshift(0x04);
+                for (let n = 0; n < 63 - message.length; n++) {
+                    message.push(0);
+                }
+            } else if (message.length + 1 <= 121) {
+                message.unshift(0x02);
+                for (let n = 0; n < 121 - message.length; n++) {
+                    message.push(0);
+                }
+                if (maxResponse > 121) {
+                    console.warn(`Response may be too long to receive. Max possible length: ${maxResponse}.`)
+                }
+            } else {
+                console.warn(`Message is too long: ${message.length} > 121 bytes`);
+                message = [];
+            }
+
+            return message;
+        }
+
+        function read(transmission) {
+            let message = [];
+            let stopFound = false;
+            let startFlag = transmission[1];
+            let j;
+
+            if (startFlag === EXTENDED_FRAME_START_FLAG) {
+                j = 4;
+            } else if (startFlag === STANDARD_FRAME_START_FLAG) {
+                j = 2;
+            } else {
+                console.warn("No start flag found");
+                return [];
+            }
+
+            while (j < transmission.length) {
+                if (transmission[j] === STOP_FRAME_FLAG) {
+                    stopFound = true;
+                    break;
+                }
+
+                message.push(transmission[j]);
+                j++;
+            }
+
+            if (!stopFound) {
+                console.warn("No stop flag found");
+                return [];
+            }
+
+            message = checkMessage(message);
+            let status = popAt(message, 0);
+
+            let response = {
+                CSAFE_GETSTATUS_CMD: [status]
+            }
+            let k = 0;
+            let wrapend = -1;
+            let wrapper = 0x0;
+
+            while (k < message.length) {
+                let result = [];
+
+                let msgCmd = message[k];
+                if (k <= wrapend) {
+                    msgCmd = wrapper | msgCmd;
+                }
+
+                let msgProp = responses[msgCmd];
+                k++;
+
+                let byteCount = message[k];
+                k++;
+
+                if (msgProp[0] === "CSAFE_GETSTATUS_CMD") {
+                    wrapper = message[k - 2] << 8;
+                    wrapend = k + byteCount - 1;
+                    if (byteCount > 0) {
+                        msgCmd = wrapper | message[k];
+                        msgProp = responses[msgCmd];
+                        k++;
+                        byteCount = message[k];
+                        k++;
+                    }
+                }
+
+                if (msgProp[0] === "CSAFE_GETCAPS_CMD") {
+                    msgProp[1] = [];
+                    for (let n = 0; n < byteCount; n++) {
+                        msgProp[1].push(1);
+                    }
+                }
+
+                if (msgProp[0] === "CSAFE_GETID_CMD") {
+                    msgProp[1] = [-byteCount];
+                }
+
+                if (Math.abs(msgProp[1].reduce((a, b) => a + b, 0)) !== 0 && byteCount !== Math.abs(msgProp[1].reduce((a, b) => a + b, 0))) {
+                    console.warn("Bytecount is an unexpected length");
+                }
+
+                msgProp[1].forEach(numBytes => {
+                    let rawBytes = message.slice(k, k + numBytes);
+                    let value;
+                    if (numBytes >= 0) {
+                        value = bytesToInt(rawBytes);
+                    } else {
+                        value = bytesToAscii(rawBytes);
+                    }
+                    result.push(value);
+                    k += Math.abs(numBytes);
+                });
+
+                response[msgProp[0]] = result;
+            }
+
+            return message;
         }
     </script>
 </body>
