@@ -20,10 +20,11 @@
 <body>
     <h3>c2tool</h3>
     <div class="row">
-        <button onclick="connect()">Connect</button>
+        <button onclick="connect()" id="connectBtn">Connect</button>
+        <button onclick="disconnect()" id="disconnectBtn" disabled>Disconnect</button>
         <p id="deviceStatus"></p>
     </div>
-    <div class="device">
+    <div id="deviceElem" style="display: none;">
 
     </div>
     <script>
@@ -31,6 +32,11 @@
         const STANDARD_FRAME_START_FLAG = 0xf1;
         const STOP_FRAME_FLAG = 0xf2;
         const BYTE_STUFFING_FLAG = 0xf3;
+        const MIN_FRAME_GAP = 50;
+        const VENDOR_ID = 0x17a4;
+        const INTERFACE = 0;
+        const IN_ENDPOINT = 0;
+        const OUT_ENDPOINT = 1;
 
         const commands = {
             CSAFE_GETSTATUS_CMD: [0x80, []],
@@ -144,28 +150,61 @@
 
         const $i = id => document.getElementById(id);
 
+        const connectBtn = $i("connectBtn");
+        const disconnectBtn = $i("disconnectBtn");
         const deviceStatus = $i("deviceStatus");
+        const deviceElem = $i("deviceElem");
+        
+        let lastSend = Date.now();
         let device;
 
         if (navigator.usb === undefined) {
             alert("WebUSB is not supported in this browser, please use the latest version of any Chromium-based browser (Chrome, Edge, Brave, etc.)");
+            console.error("WebUSB is not supported in the browser.");
         }
 
         async function connect() {
+            connectBtn.setAttribute("disabled", "");
             deviceStatus.innerText = "Waiting for selection...";
 
             try {
-                device = await navigator.usb.requestDevice({ filters: [{ vendorId: 6052 }] });
+                device = await navigator.usb.requestDevice({ filters: [{ vendorId: VENDOR_ID }] });
             } catch (e) {
+                connectBtn.removeAttribute("disabled");
                 deviceStatus.innerText = "Device selection canceled";
                 console.warn(e);
                 return;
             }
             
-            deviceStatus.innerText = `Connecting to ${device.manufacturerName} ${device.productName}...`
+            deviceStatus.innerText = `Connecting...`;
+            await device.open();
+            if (device.configuration === null) {
+                await device.selectConfiguration(1);
+            }
+
+            await device.claimInterface(INTERFACE);
+
+            let endpoints = device.configuration.interfaces[0].endpoints;
+            lastSend = Date.now();
+
             console.log(device);
             console.log(device.productName);
             console.log(device.manufacturerName);
+            deviceElem.style.display = "block";
+            disconnectBtn.removeAttribute("disabled");
+        }
+
+        async function disconnect() {
+            disconnectBtn.setAttribute("disabled", "");
+            deviceElem.style.display = "none";
+
+            await device.close();
+
+            connectBtn.removeAttribute("disabled");
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
         }
 
         function popAt(arr, index) {
@@ -205,9 +244,9 @@
         }
 
         function intToBytes(numBytes, intValue) {
-            // TODO: test for allowed range
-            // if not 0 <= integer <= 2 ** (8 * numbytes):
-            //     print "Integer is outside the allowable range"
+            if (0 > intValue || intValue > Math.pow(2, 8 * numBytes)) {
+                console.warn("Integer is outside the allowable range");
+            }
 
             let byte = [];
             for (let i = 0; i < numBytes; i++) {
@@ -439,6 +478,54 @@
             }
 
             return message;
+        }
+
+        function getErg() {
+            let results = send([
+                "CSAFE_GETVERSION_CMD",
+                "CSAFE_GETSERIAL_CMD",
+                "CSAFE_GETCAPS_CMD",
+                0x00
+            ]);
+
+            let ergData = {
+                mfgId: results["CSAFE_GETVERSION_CMD"][0],
+                cid: results["CSAFE_GETVERSION_CMD"][1],
+                model: results["CSAFE_GETVERSION_CMD"][2],
+                hwVersion: results["CSAFE_GETVERSION_CMD"][3],
+                swVersion: results["CSAFE_GETVERSION_CMD"][4],
+
+                serial: results["CSAFE_GETSERIAL_CMD"][0],
+
+                maxRx: results["CSAFE_GETCAPS_CMD"][0],
+                maxTx: results["CSAFE_GETCAPS_CMD"][1],
+                minInterFrame: results["CSAFE_GETCAPS_CMD"][2],
+
+                status: results["CSAFE_GETSTATUS_CMD"][0] & 0xf
+            };
+
+            return ergData;
+        }
+
+        async function send(message) {
+            let now = Date.now();
+            let delta = now - lastSend;
+
+            if (delta < MIN_FRAME_GAP) {
+                sleep(MIN_FRAME_GAP - delta);
+            }
+
+            let csafe = write(message);
+            let bytesWritten = (await device.transferOut(OUT_ENDPOINT, new Uint8Array(csafe))).bytesWritten;
+            lastSend = Date.now();
+
+            let response = [];
+            while (response.length === 0) {
+                let transmission = (await device.transferIn(IN_ENDPOINT, bytesWritten));
+                response = read(transmission);
+            }
+
+            return response;
         }
     </script>
 </body>
