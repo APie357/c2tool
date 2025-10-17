@@ -204,6 +204,35 @@
             return message;
         }
 
+        function intToBytes(numBytes, intValue) {
+            // TODO: test for allowed range
+            // if not 0 <= integer <= 2 ** (8 * numbytes):
+            //     print "Integer is outside the allowable range"
+
+            let byte = [];
+            for (let i = 0; i < numBytes; i++) {
+                let calcByte = (intValue >> (8 * i)) & 0xff;
+                byte.push(calcByte);
+            }
+
+            return byte;
+        }
+
+        function bytesToInt(rawBytes) {
+            let numBytes = rawBytes.length;
+            let intValue = 0;
+
+            for (let i = 0; i < numBytes; i++) {
+                intValue = (rawBytes[i] << (8 * i)) | intValue;
+            }
+
+            return intValue;
+        }
+
+        function bytesToAscii(rawBytes) {
+            return new TextDecoder().decode(rawBytes);
+        }
+
         function write(args) {
             let message = [];
             let i = 0;
